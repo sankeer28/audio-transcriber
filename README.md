@@ -143,10 +143,47 @@ CPU_BEAM_SIZE = 5            # Whisper's reference beam size
 
 ## GPU Support
 
-GPU acceleration requires an **NVIDIA** card - faster-whisper runs on CTranslate2,
-which is CUDA-only. On an AMD or Intel GPU, setting `FORCE_DEVICE = "cuda"` falls
-back to CPU automatically. With an NVIDIA GPU, set `FORCE_DEVICE = "cuda"` (or
-`None` to auto-detect) and `USE_HALF_PRECISION = True`.
+Which engine you need depends on your GPU vendor:
+
+| Your GPU | Engine | Notes |
+|---|---|---|
+| NVIDIA | `faster-whisper` | Set `FORCE_DEVICE = "cuda"` and `USE_HALF_PRECISION = True` |
+| AMD / Intel | `whisper.cpp` | Vulkan backend - vendor neutral |
+| None | `faster-whisper` | CPU with int8 |
+
+**faster-whisper cannot use an AMD GPU.** It runs on CTranslate2, which is
+CUDA-only; there is no ROCm backend, and the community ROCm forks target
+gfx900-gfx1151, which excludes RDNA4 (gfx1201). Setting `FORCE_DEVICE = "cuda"`
+on an AMD card silently falls back to CPU.
+
+### whisper.cpp (Vulkan) setup
+
+Measured on an AMD RX 9070 XT with `large-v3`: **~22x realtime** (a 15.8-minute
+lecture transcribed in 43 seconds), versus ~1.3x realtime on CPU.
+
+1. Download a Windows Vulkan build of whisper.cpp and extract it to `whispercpp/`
+   so that `whispercpp/whisper-cli.exe` exists. The official whisper.cpp releases
+   ship CPU/BLAS/cuBLAS builds only - no Vulkan - so use a prebuilt Vulkan
+   package such as
+   [jerryshell/whisper.cpp-windows-vulkan-bin](https://github.com/jerryshell/whisper.cpp-windows-vulkan-bin),
+   or build from source with `-DGGML_VULKAN=1`.
+2. Download a GGML model into `models/`:
+   ```bash
+   curl -L -o models/ggml-large-v3.bin      https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+   ```
+3. Set the engine in `main.py`:
+   ```python
+   TRANSCRIPTION_ENGINE = "whisper.cpp"
+   WHISPERCPP_MODEL = "models/ggml-large-v3.bin"
+   WHISPERCPP_GPU_DEVICE = 0   # Vulkan device index
+   ```
+
+On startup whisper.cpp lists the Vulkan devices it found. Confirm your discrete
+GPU is the one at `WHISPERCPP_GPU_DEVICE`, since integrated graphics often
+enumerate alongside it.
+
+Note that GGML models are a different format from the CTranslate2 models used by
+`faster-whisper` - switching engines means downloading the model again.
 
 ## Cleaning Transcripts
 

@@ -5,6 +5,8 @@ import shutil
 import re
 import warnings
 import json
+import subprocess
+import tempfile
 from pathlib import Path
 from pptx import Presentation
 from faster_whisper import WhisperModel
@@ -37,9 +39,18 @@ PPTX_FOLDER = "presentations"   # input folder
 OUTPUT_FOLDER = "output"        # output folder
 
 # 🚀 Transcription Engine Selection
-# "standard" = openai-whisper (original implementation, reliable)
-# "faster-whisper" = 4-5x faster, uses less memory, supports INT8 quantization on CPU
-TRANSCRIPTION_ENGINE = "faster-whisper"  # Options: "standard", "faster-whisper" (recommended)
+# "standard"       = openai-whisper (original implementation, reliable)
+# "faster-whisper" = CPU-focused; GPU requires an NVIDIA card (CTranslate2 is CUDA-only)
+# "whisper.cpp"    = GPU via Vulkan - works on AMD/Intel/NVIDIA. Fastest option on
+#                    this machine (AMD RX 9070 XT): ~22x realtime vs ~1.3x on CPU.
+TRANSCRIPTION_ENGINE = "whisper.cpp"  # Options: "standard", "faster-whisper", "whisper.cpp"
+
+# 🖥️ whisper.cpp Settings (only used when TRANSCRIPTION_ENGINE = "whisper.cpp")
+WHISPERCPP_BIN = os.path.join("whispercpp", "whisper-cli.exe")
+WHISPERCPP_MODEL = os.path.join("models", "ggml-large-v3.bin")
+WHISPERCPP_GPU_DEVICE = 0   # Vulkan device index (0 = first GPU listed at startup)
+WHISPERCPP_THREADS = 12     # CPU threads for the non-GPU parts (mel, tokenizer)
+FFMPEG_BIN = "ffmpeg"       # ffmpeg executable, used to convert input to 16kHz mono WAV
 
 # 🎯 Whisper Model Settings
 # "large-v3" is the most accurate model. "large-v3-turbo" is ~4x faster with a
@@ -114,7 +125,21 @@ def load_standard_whisper(target_device="cpu"):
 model = None
 faster_model = None
 
-if TRANSCRIPTION_ENGINE == "faster-whisper":
+if TRANSCRIPTION_ENGINE == "whisper.cpp":
+    # No model is loaded in-process; whisper-cli.exe loads it per file.
+    if not os.path.isfile(WHISPERCPP_BIN):
+        raise SystemExit(f"[!] whisper.cpp binary not found: {WHISPERCPP_BIN}\n"
+                         f"    Download the Vulkan build and extract it there, or switch "
+                         f"TRANSCRIPTION_ENGINE to 'faster-whisper'.")
+    if not os.path.isfile(WHISPERCPP_MODEL):
+        raise SystemExit(f"[!] whisper.cpp model not found: {WHISPERCPP_MODEL}\n"
+                         f"    Download a GGML model, e.g. ggml-large-v3.bin from "
+                         f"https://huggingface.co/ggerganov/whisper.cpp")
+    if shutil.which(FFMPEG_BIN) is None:
+        raise SystemExit(f"[!] ffmpeg not found on PATH - required to decode audio for whisper.cpp")
+    print(f"Using whisper.cpp ({os.path.basename(WHISPERCPP_MODEL)}) on Vulkan device {WHISPERCPP_GPU_DEVICE}")
+    print(f"[OK] GPU acceleration via Vulkan")
+elif TRANSCRIPTION_ENGINE == "faster-whisper":
     print(f"Loading faster-whisper model ({WHISPER_MODEL}) on {device}...")
     # For faster-whisper, we need to specify compute type
     compute_type = CPU_COMPUTE_TYPE if device == "cpu" else "float16"
@@ -189,11 +214,95 @@ def save_checkpoint(checkpoint_file, checkpoint_data):
     with open(checkpoint_file, 'w', encoding='utf-8') as f:
         json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
 
+def convert_to_wav16k(src_path, dst_path):
+    """Decode any input (mp3/mp4/m4a/wav) to the 16kHz mono WAV whisper.cpp expects."""
+    subprocess.run(
+        [FFMPEG_BIN, "-y", "-loglevel", "error", "-i", src_path,
+         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", dst_path],
+        check=True
+    )
+
+def transcribe_with_whispercpp(audio_path, checkpoint_file):
+    """Transcribe via whisper.cpp on the GPU (Vulkan), with checkpoint/resume support."""
+    checkpoint = load_checkpoint(checkpoint_file)
+    if checkpoint and checkpoint.get("segments"):
+        resume_from = checkpoint["segments"][-1]["end"]
+        print(f"[Checkpoint] Found existing progress! "
+              f"{len(checkpoint['segments'])} segments ({resume_from:.1f}s)")
+    else:
+        checkpoint = {"segments": [], "metadata": {}}
+        resume_from = 0.0
+        print(f"[Transcribing] Starting new transcription...")
+
+    temp_dir = tempfile.mkdtemp(prefix="wcpp_")
+    try:
+        wav_path = os.path.join(temp_dir, "audio.wav")
+        convert_to_wav16k(audio_path, wav_path)
+        out_base = os.path.join(temp_dir, "result")
+
+        cmd = [
+            WHISPERCPP_BIN,
+            "-m", WHISPERCPP_MODEL,
+            "-f", wav_path,
+            "-t", str(WHISPERCPP_THREADS),
+            "-bs", str(GPU_BEAM_SIZE),
+            "-dev", str(WHISPERCPP_GPU_DEVICE),
+            "-oj", "-of", out_base,
+            "-pp",
+        ]
+        if FORCE_LANGUAGE:
+            cmd += ["-l", FORCE_LANGUAGE]
+        # Resume: skip audio we already transcribed. whisper.cpp reports timestamps
+        # relative to this offset, so it is added back when parsing below.
+        if resume_from > 0:
+            cmd += ["-ot", str(int(resume_from * 1000))]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace")
+        progress_re = re.compile(r"progress\s*=\s*(\d+)%")
+        with tqdm(total=100, desc="Transcribing (GPU)", unit="%",
+                  bar_format="{l_bar}{bar}| {n:.0f}/100% [{elapsed}<{remaining}]") as pbar:
+            for line in proc.stderr:
+                m = progress_re.search(line)
+                if m:
+                    pct = int(m.group(1))
+                    pbar.update(max(0, pct - pbar.n))
+            proc.wait()
+            if proc.returncode == 0:
+                pbar.update(max(0, 100 - pbar.n))
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"whisper-cli failed with exit code {proc.returncode}")
+
+        with open(out_base + ".json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for item in data.get("transcription", []):
+            offsets = item.get("offsets", {})
+            checkpoint["segments"].append({
+                "start": resume_from + offsets.get("from", 0) / 1000.0,
+                "end": resume_from + offsets.get("to", 0) / 1000.0,
+                "text": item.get("text", ""),
+            })
+
+        checkpoint["metadata"] = {"file": str(audio_path), "engine": "whisper.cpp"}
+        save_checkpoint(checkpoint_file, checkpoint)
+        print(f"[Completed] Transcription finished! Total segments: {len(checkpoint['segments'])}")
+
+        text = " ".join(seg["text"] for seg in checkpoint["segments"])
+        print(f"[Cleanup] Removing checkpoint file...")
+        checkpoint_file.unlink(missing_ok=True)
+        return {"text": text.strip()}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 def transcribe_single_file(audio_path):
     """Transcribe a single audio/video file using the selected engine with checkpoint support."""
     checkpoint_file = get_checkpoint_file(audio_path)
-    
-    if TRANSCRIPTION_ENGINE == "faster-whisper":
+
+    if TRANSCRIPTION_ENGINE == "whisper.cpp":
+        return transcribe_with_whispercpp(audio_path, checkpoint_file)
+    elif TRANSCRIPTION_ENGINE == "faster-whisper":
         # Check for existing checkpoint
         checkpoint = load_checkpoint(checkpoint_file)
         if checkpoint and checkpoint.get("segments"):
@@ -342,8 +451,8 @@ def transcribe_audio(audio_files):
         except Exception as e:
             progress_bar.write(f"[!] Error with {filename}: {e}")
             result = None
-            # Fallback - try with standard whisper if faster-whisper fails
-            if TRANSCRIPTION_ENGINE == "faster-whisper":
+            # Fallback - try with standard whisper if the GPU/faster path fails
+            if TRANSCRIPTION_ENGINE in ("faster-whisper", "whisper.cpp"):
                 progress_bar.write(f"[!] Falling back to standard whisper for {filename}...")
                 try:
                     cpu_model = load_standard_whisper("cpu")

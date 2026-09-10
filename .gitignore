@@ -24,3 +24,7 @@ Thumbs.db
 
 # Virtual environment
 .venv/
+
+# whisper.cpp binaries and GGML models
+whispercpp/
+models/
