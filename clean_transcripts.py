@@ -2,31 +2,66 @@ import re
 import os
 from pathlib import Path
 
+# Set to True to restore the old, more destructive behaviour: any two long words
+# where one contains the other count as duplicates, and every doubled word is
+# collapsed to a single occurrence. This mangles legitimate text
+# ("had had", "New York, New York", "state statement"), so it is off by default.
+AGGRESSIVE = False
+
+_INFLECTIONAL_SUFFIXES = ("ings", "ing", "ies", "es", "ed", "s")
+
+
+def _stem(word):
+    """Crude stemmer: strip a single inflectional suffix if enough stem remains."""
+    for suffix in _INFLECTIONAL_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[:-len(suffix)]
+    return word
+
+
+def _same_word(a, b):
+    """True when two words are the same word, allowing for inflection.
+
+    Unlike a plain substring test, this does not treat 'state'/'statement' or
+    'bio'/'biology' as duplicates - only forms that share a stem, such as
+    'process'/'processing' or 'study'/'studies'.
+    """
+    if a == b:
+        return True
+    if AGGRESSIVE:
+        return len(a) > 4 and len(b) > 4 and (a in b or b in a)
+
+    stem_a, stem_b = _stem(a), _stem(b)
+    if len(stem_a) < 4 or len(stem_b) < 4:
+        return False
+    if stem_a == stem_b:
+        return True
+    # Tolerate a dropped 'e' ('use'/'using') or a doubled consonant ('run'/'running')
+    return stem_a.rstrip('e') == stem_b.rstrip('e') or stem_a == stem_b[:-1] or stem_b == stem_a[:-1]
+
+
 def remove_similar_word_sequences(text):
-    """Remove sequences of similar/related words like 'biodiversity diversity diversity'."""
+    """Remove runs of the same word repeated in different forms ('study studies studied')."""
     words = text.split()
     cleaned = []
     i = 0
-    
+
     while i < len(words):
         current_word = words[i].lower().strip('.,;:!?')
-        
-        # Check for related words (one contains the other)
+
+        # Check for related words (same word, possibly inflected)
         j = i + 1
         similar_count = 0
-        
+
         while j < len(words):
             next_word = words[j].lower().strip('.,;:!?')
-            
-            # Check if words are related (substring match or exact match)
-            if (current_word == next_word or 
-                (len(current_word) > 4 and len(next_word) > 4 and 
-                 (current_word in next_word or next_word in current_word))):
+
+            if _same_word(current_word, next_word):
                 similar_count += 1
                 j += 1
             else:
                 break
-        
+
         # If we found 2+ similar words, keep only the first one
         if similar_count >= 2:
             cleaned.append(words[i])
@@ -149,8 +184,12 @@ def clean_transcript_file(file_path):
         # Pass 4: Another pass for phrases (catches nested patterns)
         cleaned_text = remove_repetitive_phrases(cleaned_text, min_phrase_words=3)
         
-        # Pass 5: Final cleanup of word repetitions
-        cleaned_text = remove_word_repetitions(cleaned_text, max_consecutive=1)
+        # Pass 5: Final cleanup of word repetitions. Keep two occurrences unless
+        # AGGRESSIVE is set - English genuinely doubles words ("had had",
+        # "that that", "New York, New York") and collapsing to one corrupts them.
+        cleaned_text = remove_word_repetitions(
+            cleaned_text, max_consecutive=1 if AGGRESSIVE else 2
+        )
         
         # Clean up extra whitespace
         cleaned_text = re.sub(r'\s+', ' ', cleaned_text)

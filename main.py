@@ -7,10 +7,21 @@ import warnings
 import json
 from pathlib import Path
 from pptx import Presentation
-import whisper
 from faster_whisper import WhisperModel
-import torch
+import ctranslate2
 from tqdm import tqdm
+
+# openai-whisper (and its torch dependency) is optional - it is only needed for
+# TRANSCRIPTION_ENGINE = "standard" and for the fallback path in transcribe_audio.
+try:
+    import whisper
+except ImportError:
+    whisper = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 # Fix Windows console encoding issues
 if sys.platform == 'win32':
@@ -31,44 +42,73 @@ OUTPUT_FOLDER = "output"        # output folder
 TRANSCRIPTION_ENGINE = "faster-whisper"  # Options: "standard", "faster-whisper" (recommended)
 
 # 🎯 Whisper Model Settings
-WHISPER_MODEL = "small"       # Options: "tiny", "base", "small", "medium", "large"
+# "large-v3" is the most accurate model. "large-v3-turbo" is ~4x faster with a
+# small accuracy cost; "medium" / "small" trade more accuracy for more speed.
+WHISPER_MODEL = "large-v3"      # Options: "tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"
 FORCE_LANGUAGE = "en"           # Force language to prevent mixing (None for auto-detect)
 
 # ⚡ Performance Settings
 FORCE_DEVICE = "cpu"             # Options: None (auto), "cpu", "cuda" (force specific device)
 USE_HALF_PRECISION = False       # fp16 for 30-50% speed boost (minimal accuracy loss)
+CPU_THREADS = 12                 # CPU worker threads (0 = faster-whisper default, which is conservative)
+CPU_COMPUTE_TYPE = "int8"        # "int8" (fast, near-identical quality) or "float32" (slowest, reference quality)
 GPU_BEST_OF = 3                 # Decoding attempts on GPU (higher = more accurate, slower)
-GPU_BEAM_SIZE = 3               # Beam search size on GPU
+GPU_BEAM_SIZE = 5               # Beam search size on GPU
 CPU_BEST_OF = 3                 # Decoding attempts on CPU
-CPU_BEAM_SIZE = 3               # Beam search size on CPU
+CPU_BEAM_SIZE = 5               # Beam search size on CPU (5 = Whisper's reference setting)
 
 # 🎚️ Quality Settings
 TEMPERATURE = 0.0               # 0.0 = deterministic, 0.1-1.0 = more creative
 ENABLE_WORD_TIMESTAMPS = True   # Get word-level timing data
 
+os.makedirs(PPTX_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+def cuda_available():
+    """Detect CUDA without requiring torch (ctranslate2 ships with faster-whisper)."""
+    try:
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return torch is not None and torch.cuda.is_available()
+
+def clear_gpu_cache():
+    """Release cached GPU memory when torch is installed and CUDA is in use."""
+    if device == "cuda" and torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 # ⚡ Load Whisper model with optimal device selection
 def get_optimal_device():
     # Check if user forced a specific device
     if FORCE_DEVICE:
-        if FORCE_DEVICE == "cuda" and not torch.cuda.is_available():
+        if FORCE_DEVICE == "cuda" and not cuda_available():
             print("[!] CUDA requested but not available, falling back to CPU")
             return "cpu"
         print(f"[*] Forced device: {FORCE_DEVICE}")
         return FORCE_DEVICE
 
     # Auto-detect best device
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
+    if cuda_available():
+        if torch is not None and torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
+        else:
+            print(f"GPU detected ({ctranslate2.get_cuda_device_count()} CUDA device(s))")
         return "cuda"
     else:
         print("No GPU detected, using CPU")
         return "cpu"
 
 device = get_optimal_device()
+
+def load_standard_whisper(target_device="cpu"):
+    """Load openai-whisper, with a clear error if the optional dependency is missing."""
+    if whisper is None:
+        raise RuntimeError(
+            "openai-whisper is not installed. Install it with "
+            "'pip install openai-whisper torch' to use the 'standard' engine."
+        )
+    return whisper.load_model(WHISPER_MODEL, device=target_device)
 
 # ⚡ Load the appropriate Whisper model based on selected engine
 model = None
@@ -77,17 +117,19 @@ faster_model = None
 if TRANSCRIPTION_ENGINE == "faster-whisper":
     print(f"Loading faster-whisper model ({WHISPER_MODEL}) on {device}...")
     # For faster-whisper, we need to specify compute type
-    compute_type = "float16" if device == "cuda" and USE_HALF_PRECISION else "int8" if device == "cpu" else "float16"
-    faster_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
-    print(f"[OK] Using faster-whisper with {compute_type} precision")
+    compute_type = CPU_COMPUTE_TYPE if device == "cpu" else "float16"
+    faster_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type,
+                                cpu_threads=CPU_THREADS)
+    print(f"[OK] Using faster-whisper with {compute_type} precision"
+          + (f" on {CPU_THREADS} threads" if device == "cpu" and CPU_THREADS else ""))
 elif TRANSCRIPTION_ENGINE == "standard":
     print(f"Loading standard openai-whisper model ({WHISPER_MODEL}) on {device}...")
-    model = whisper.load_model(WHISPER_MODEL, device=device)
+    model = load_standard_whisper(device)
     print(f"[OK] Using standard openai-whisper")
 else:
     print(f"[!] Invalid TRANSCRIPTION_ENGINE '{TRANSCRIPTION_ENGINE}', falling back to standard")
     TRANSCRIPTION_ENGINE = "standard"
-    model = whisper.load_model(WHISPER_MODEL, device=device)
+    model = load_standard_whisper(device)
 
 def extract_text_from_pptx(pptx_path):
     """Extract all text from slides in a PPTX."""
@@ -154,50 +196,66 @@ def transcribe_single_file(audio_path):
     if TRANSCRIPTION_ENGINE == "faster-whisper":
         # Check for existing checkpoint
         checkpoint = load_checkpoint(checkpoint_file)
-        if checkpoint:
-            last_segment_idx = len(checkpoint.get("segments", []))
-            last_timestamp = checkpoint["segments"][-1]["end"] if checkpoint.get("segments") else 0
-            print(f"[Checkpoint] Found existing progress! {last_segment_idx} segments ({last_timestamp:.1f}s)")
+        if checkpoint and checkpoint.get("segments"):
+            resume_from = checkpoint["segments"][-1]["end"]
+            print(f"[Checkpoint] Found existing progress! "
+                  f"{len(checkpoint['segments'])} segments ({resume_from:.1f}s)")
         else:
             checkpoint = {"segments": [], "metadata": {}}
-            last_segment_idx = 0
-            last_timestamp = 0
+            resume_from = 0.0
             print(f"[Transcribing] Starting new transcription...")
-        
-        segments, info = faster_model.transcribe(
-            audio_path,
+
+        transcribe_kwargs = dict(
             language=FORCE_LANGUAGE,
             task="transcribe",
             temperature=TEMPERATURE,
             beam_size=GPU_BEAM_SIZE if device == "cuda" else CPU_BEAM_SIZE,
             word_timestamps=ENABLE_WORD_TIMESTAMPS
         )
-        
+
+        # Resume by seeking the decoder to where we left off, so already-transcribed
+        # audio is not decoded a second time. clip_timestamps with an odd number of
+        # values runs from that offset to the end of the file, and the segment
+        # timestamps it yields are absolute.
+        skip_until = 0.0
+        if resume_from > 0:
+            try:
+                segments, info = faster_model.transcribe(
+                    audio_path, clip_timestamps=[resume_from], **transcribe_kwargs
+                )
+            except TypeError:
+                # Older faster-whisper without clip_timestamps support: re-decode from
+                # the start and drop what we already have.
+                print("[!] This faster-whisper build cannot seek; re-decoding from start")
+                skip_until = resume_from
+                segments, info = faster_model.transcribe(audio_path, **transcribe_kwargs)
+        else:
+            segments, info = faster_model.transcribe(audio_path, **transcribe_kwargs)
+
         # Store metadata
         checkpoint["metadata"] = {
             "duration": info.duration,
             "language": info.language,
             "file": str(audio_path)
         }
-        
+
         print(f"[Info] Duration: {info.duration:.1f}s | Language: {info.language}")
-        if last_segment_idx == 0:
+        if resume_from == 0:
             print(f"[Checkpoint] Saving to: {checkpoint_file}")
-        
+
         # Create progress bar
-        with tqdm(total=int(info.duration), desc="Transcribing", unit="s", 
+        with tqdm(total=int(info.duration), desc="Transcribing", unit="s",
                   bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f}s [{elapsed}<{remaining}]",
-                  initial=int(last_timestamp)) as pbar:
-            
-            segment_index = 0
-            last_position = int(last_timestamp)
-            
+                  initial=int(resume_from)) as pbar:
+
+            new_segments = 0
+            last_position = int(resume_from)
+
             for segment in segments:
-                # Skip already processed segments
-                if segment_index < last_segment_idx:
-                    segment_index += 1
+                # Only relevant on the no-seek fallback path
+                if segment.end <= skip_until:
                     continue
-                
+
                 # Add new segment to checkpoint
                 segment_data = {
                     'start': segment.start,
@@ -205,20 +263,20 @@ def transcribe_single_file(audio_path):
                     'text': segment.text
                 }
                 checkpoint["segments"].append(segment_data)
-                
+                new_segments += 1
+
                 # Save checkpoint every 10 segments (balance between safety and I/O)
-                if segment_index % 10 == 0 or segment_index == last_segment_idx:
+                if new_segments % 10 == 0:
                     save_checkpoint(checkpoint_file, checkpoint)
-                
+
                 # Update progress bar
                 current_position = int(segment.end)
-                pbar.update(current_position - last_position)
+                pbar.update(max(0, current_position - last_position))
                 last_position = current_position
-                segment_index += 1
-            
+
             # Final save
             save_checkpoint(checkpoint_file, checkpoint)
-        
+
         print(f"[Completed] Transcription finished! Total segments: {len(checkpoint['segments'])}")
         
         # Extract text from checkpoint
@@ -279,25 +337,39 @@ def transcribe_audio(audio_files):
             # Use the unified transcribe function
             result = transcribe_single_file(audio_path)
 
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
             progress_bar.write(f"[!] Error with {filename}: {e}")
+            result = None
             # Fallback - try with standard whisper if faster-whisper fails
             if TRANSCRIPTION_ENGINE == "faster-whisper":
                 progress_bar.write(f"[!] Falling back to standard whisper for {filename}...")
-                cpu_model = whisper.load_model(WHISPER_MODEL, device="cpu")
-                result = cpu_model.transcribe(
-                    audio_path,
-                    language=FORCE_LANGUAGE,
-                    temperature=TEMPERATURE
+                try:
+                    cpu_model = load_standard_whisper("cpu")
+                    result = cpu_model.transcribe(
+                        audio_path,
+                        language=FORCE_LANGUAGE,
+                        temperature=TEMPERATURE
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception as fallback_error:
+                    progress_bar.write(f"[!] Fallback also failed for {filename}: {fallback_error}")
+
+            # Skip this file rather than aborting the whole run
+            if result is None:
+                progress_bar.write(f"[!] Skipping {filename}")
+                transcripts.append(
+                    f"--- Audio {media_num} Transcript ---\n[Transcription failed: {e}]"
                 )
-            else:
-                raise e
+                clear_gpu_cache()
+                continue
 
         transcripts.append(f"--- Audio {media_num} Transcript ---\n{result['text'].strip()}")
 
         # Clear GPU cache periodically if using CUDA
-        if device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        clear_gpu_cache()
 
     progress_bar.close()
     return "\n\n".join(transcripts)
@@ -315,7 +387,15 @@ def process_pptx(pptx_path):
 
         # Embedded audio
         audio_files = extract_audio_from_pptx(pptx_path, temp_dir)
-        transcript = transcribe_audio(audio_files) if audio_files else ""
+        transcript = ""
+        if audio_files:
+            try:
+                transcript = transcribe_audio(audio_files)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"[ERROR] Audio transcription failed for {pptx_path}: {e}")
+                print("[!] Saving slide text only")
 
         # Combine output with improved organization
         final_output = []
@@ -357,8 +437,7 @@ def process_mp3(mp3_path):
         print(f"[OK] Saved transcription to {output_path}")
 
         # Clear GPU cache if using CUDA
-        if device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        clear_gpu_cache()
 
     except Exception as e:
         print(f"[ERROR] Error processing {mp3_path}: {e}")
@@ -381,8 +460,7 @@ def process_mp4(mp4_path):
         print(f"[OK] Saved transcription to {output_path}")
 
         # Clear GPU cache if using CUDA
-        if device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        clear_gpu_cache()
 
     except Exception as e:
         print(f"[ERROR] Error processing {mp4_path}: {e}")

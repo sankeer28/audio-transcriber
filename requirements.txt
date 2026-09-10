@@ -1,6 +1,9 @@
+# Core dependencies
 python-pptx==0.6.23
-openai-whisper==20231117
 faster-whisper>=1.0.0
-torch>=2.0.0
-torchaudio>=2.0.0
 tqdm>=4.66.0
+
+# Optional: only needed for TRANSCRIPTION_ENGINE = "standard" and the CPU
+# fallback path. These pull in torch (several GB); faster-whisper uses
+# CTranslate2 instead and does not need them.
+#   pip install -r requirements-standard.txt

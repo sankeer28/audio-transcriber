@@ -1,0 +1,4 @@
+# Optional extras for TRANSCRIPTION_ENGINE = "standard"
+openai-whisper==20231117
+torch>=2.0.0
+torchaudio>=2.0.0
