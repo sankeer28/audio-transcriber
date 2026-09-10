@@ -23,53 +23,69 @@ Extract text and transcribe audio from PowerPoint presentations, MP4 videos, and
 - **Multiple Models**: Supports various Whisper model sizes (tiny, base, small, medium, large)
 - **Configurable**: Easy-to-modify settings for performance and quality tuning
 
+## Quick Start
+
+```bash
+# 1. Install Python dependencies
+pip install -r requirements.txt
+
+# 2. (Optional but recommended) install GPU acceleration
+python setup.py
+
+# 3. Drop your .pptx / .mp4 / .mp3 files into presentations/
+# 4. Transcribe - results appear in output/
+python main.py
+```
+
+That's it. `main.py` picks the fastest engine available on your machine
+automatically; no configuration is required.
+
+You also need **ffmpeg** on your PATH (see [Installing ffmpeg](#installing-ffmpeg)).
+
+### Should I run setup.py?
+
+`setup.py` downloads whisper.cpp with the Vulkan GPU backend plus a model
+(~3 GB). It is worth it if you have any dedicated GPU:
+
+| | Without setup.py | With setup.py |
+|---|---|---|
+| AMD / Intel GPU | CPU only | GPU - much faster |
+| NVIDIA GPU | GPU via CUDA | GPU via Vulkan |
+| No GPU | CPU only | CPU only (skip it) |
+
+On an AMD RX 9070 XT, a 15.8-minute lecture took **43 seconds** with `setup.py`
+versus an estimated ~12 minutes on CPU alone.
+
+Skipping it is fine - `main.py` falls back to the CPU engine, which downloads
+its own model on first run and needs no setup at all.
+
 ## Requirements
 
 - Python 3.8 or higher
-- ffmpeg (for MP4 video processing)
-- CUDA-compatible GPU (optional)
-- PyTorch + openai-whisper (optional, only for `TRANSCRIPTION_ENGINE = "standard"`)
+- ffmpeg
+- A GPU is optional - everything works on CPU, just slower
 
-## Installation
-
-### 1. Clone or Download the Project
-
-### 2. Install Python Dependencies
+<a name="installing-ffmpeg"></a>
+### Installing ffmpeg
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate      # Windows
-source .venv/bin/activate    # macOS / Linux
+# Windows
+choco install ffmpeg          # or download from https://ffmpeg.org/download.html
 
-pip install -r requirements.txt
+# macOS
+brew install ffmpeg
+
+# Linux
+sudo apt install ffmpeg
 ```
 
-The default `faster-whisper` engine does **not** need PyTorch. Only install the
-optional extras if you want `TRANSCRIPTION_ENGINE = "standard"` (openai-whisper),
-which pulls in several GB of dependencies:
+### Optional: openai-whisper engine
+
+The default engines do not need PyTorch. Only install these extras if you
+specifically want `TRANSCRIPTION_ENGINE = "standard"` (several GB):
 
 ```bash
 pip install -r requirements-standard.txt
-```
-
-### 3. Install ffmpeg
-
-#### Windows:
-```bash
-# Using chocolatey:
-choco install ffmpeg
-
-# Or download from: https://ffmpeg.org/download.html
-```
-
-#### macOS:
-```bash
-brew install ffmpeg
-```
-
-#### Linux:
-```bash
-sudo apt install ffmpeg
 ```
 
 ## Usage
@@ -93,8 +109,10 @@ Edit the configuration settings at the top of `main.py`:
 
 ### Transcription Engine
 ```python
-TRANSCRIPTION_ENGINE = "faster-whisper"  # Options: "standard", "faster-whisper"
+TRANSCRIPTION_ENGINE = "auto"   # "auto", "whisper.cpp", "faster-whisper", "standard"
 ```
+`"auto"` (the default) picks whisper.cpp on the GPU if `setup.py` has been run,
+then an NVIDIA GPU via CUDA, then CPU. Set it explicitly to override.
 
 ### Folder Settings
 ```python
@@ -112,14 +130,15 @@ FORCE_LANGUAGE = "en"         # Force language ("en", "es", "fr", etc.) or None
 ```python
 FORCE_DEVICE = "cpu"          # Options: None (auto), "cpu", "cuda"
 USE_HALF_PRECISION = False    # Enable fp16 for speed boost (NVIDIA GPU only)
-CPU_THREADS = 12              # CPU worker threads (0 = library default)
+CPU_THREADS = 0               # CPU worker threads (0 = auto-detect)
 CPU_COMPUTE_TYPE = "int8"     # "int8" or "float32"
 ```
 
 ## Model Size Guide
 
-Measured on this machine (Ryzen 9 9900X3D, 12 threads, int8, CPU-only) against a
-123-second clip:
+CPU speeds below were measured on a Ryzen 9 9900X3D (12 threads, int8) against a
+123-second clip. With `setup.py` installed, GPU transcription is far faster - see
+[GPU Support](#gpu-support).
 
 | Model  | Speed | Quality | Memory | Best For |
 |--------|-------|---------|--------|----------|
@@ -132,14 +151,6 @@ Measured on this machine (Ryzen 9 9900X3D, 12 threads, int8, CPU-only) against a
 
 A one-hour recording takes roughly 45 minutes on `large-v3`, versus about three
 minutes on `small`. Switch models via `WHISPER_MODEL` in `main.py`.
-
-### Whisper Model Settings
-```python
-WHISPER_MODEL = "large-v3"   # Most accurate
-CPU_THREADS = 12             # Match your core count
-CPU_COMPUTE_TYPE = "int8"    # "float32" for reference quality (much slower)
-CPU_BEAM_SIZE = 5            # Whisper's reference beam size
-```
 
 ## GPU Support
 
@@ -161,6 +172,8 @@ on an AMD card silently falls back to CPU.
 Measured on an AMD RX 9070 XT with `large-v3`: **~22x realtime** (a 15.8-minute
 lecture transcribed in 43 seconds), versus ~1.3x realtime on CPU.
 
+Run `python setup.py` and it handles all of this for you. To do it by hand:
+
 1. Download a Windows Vulkan build of whisper.cpp and extract it to `whispercpp/`
    so that `whispercpp/whisper-cli.exe` exists. The official whisper.cpp releases
    ship CPU/BLAS/cuBLAS builds only - no Vulkan - so use a prebuilt Vulkan
@@ -171,7 +184,8 @@ lecture transcribed in 43 seconds), versus ~1.3x realtime on CPU.
    ```bash
    curl -L -o models/ggml-large-v3.bin      https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
    ```
-3. Set the engine in `main.py`:
+3. Nothing to configure - `TRANSCRIPTION_ENGINE = "auto"` detects the files and
+   switches to the GPU engine on its own. To pin it explicitly:
    ```python
    TRANSCRIPTION_ENGINE = "whisper.cpp"
    WHISPERCPP_MODEL = "models/ggml-large-v3.bin"

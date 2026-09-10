@@ -39,17 +39,18 @@ PPTX_FOLDER = "presentations"   # input folder
 OUTPUT_FOLDER = "output"        # output folder
 
 # 🚀 Transcription Engine Selection
-# "standard"       = openai-whisper (original implementation, reliable)
-# "faster-whisper" = CPU-focused; GPU requires an NVIDIA card (CTranslate2 is CUDA-only)
-# "whisper.cpp"    = GPU via Vulkan - works on AMD/Intel/NVIDIA. Fastest option on
-#                    this machine (AMD RX 9070 XT): ~22x realtime vs ~1.3x on CPU.
-TRANSCRIPTION_ENGINE = "whisper.cpp"  # Options: "standard", "faster-whisper", "whisper.cpp"
+# "auto"           = pick the best available (recommended - see resolve_engine below)
+# "whisper.cpp"    = GPU via Vulkan; works on AMD/Intel/NVIDIA. Needs `python setup.py`
+# "faster-whisper" = CPU, or NVIDIA GPU via CUDA. Downloads its own model on first run
+# "standard"       = openai-whisper (original implementation, needs torch)
+TRANSCRIPTION_ENGINE = "auto"  # Options: "auto", "whisper.cpp", "faster-whisper", "standard"
 
-# 🖥️ whisper.cpp Settings (only used when TRANSCRIPTION_ENGINE = "whisper.cpp")
-WHISPERCPP_BIN = os.path.join("whispercpp", "whisper-cli.exe")
+# 🖥️ whisper.cpp Settings (only used when the whisper.cpp engine is active)
+_EXE = ".exe" if sys.platform == "win32" else ""
+WHISPERCPP_BIN = os.path.join("whispercpp", "whisper-cli" + _EXE)
 WHISPERCPP_MODEL = os.path.join("models", "ggml-large-v3.bin")
 WHISPERCPP_GPU_DEVICE = 0   # Vulkan device index (0 = first GPU listed at startup)
-WHISPERCPP_THREADS = 12     # CPU threads for the non-GPU parts (mel, tokenizer)
+WHISPERCPP_THREADS = 0      # CPU threads for non-GPU parts (0 = auto-detect)
 FFMPEG_BIN = "ffmpeg"       # ffmpeg executable, used to convert input to 16kHz mono WAV
 
 # 🎯 Whisper Model Settings
@@ -61,7 +62,7 @@ FORCE_LANGUAGE = "en"           # Force language to prevent mixing (None for aut
 # ⚡ Performance Settings
 FORCE_DEVICE = "cpu"             # Options: None (auto), "cpu", "cuda" (force specific device)
 USE_HALF_PRECISION = False       # fp16 for 30-50% speed boost (minimal accuracy loss)
-CPU_THREADS = 12                 # CPU worker threads (0 = faster-whisper default, which is conservative)
+CPU_THREADS = 0                  # CPU worker threads (0 = auto-detect from your core count)
 CPU_COMPUTE_TYPE = "int8"        # "int8" (fast, near-identical quality) or "float32" (slowest, reference quality)
 GPU_BEST_OF = 3                 # Decoding attempts on GPU (higher = more accurate, slower)
 GPU_BEAM_SIZE = 5               # Beam search size on GPU
@@ -88,17 +89,20 @@ def clear_gpu_cache():
         torch.cuda.empty_cache()
 
 # ⚡ Load Whisper model with optimal device selection
-def get_optimal_device():
+def get_optimal_device(verbose=True):
     # Check if user forced a specific device
     if FORCE_DEVICE:
         if FORCE_DEVICE == "cuda" and not cuda_available():
             print("[!] CUDA requested but not available, falling back to CPU")
             return "cpu"
-        print(f"[*] Forced device: {FORCE_DEVICE}")
+        if verbose:
+            print(f"[*] Forced device: {FORCE_DEVICE}")
         return FORCE_DEVICE
 
     # Auto-detect best device
     if cuda_available():
+        if not verbose:
+            return "cuda"
         if torch is not None and torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -107,10 +111,9 @@ def get_optimal_device():
             print(f"GPU detected ({ctranslate2.get_cuda_device_count()} CUDA device(s))")
         return "cuda"
     else:
-        print("No GPU detected, using CPU")
+        if verbose:
+            print("No GPU detected, using CPU")
         return "cpu"
-
-device = get_optimal_device()
 
 def load_standard_whisper(target_device="cpu"):
     """Load openai-whisper, with a clear error if the optional dependency is missing."""
@@ -125,18 +128,55 @@ def load_standard_whisper(target_device="cpu"):
 model = None
 faster_model = None
 
+def whispercpp_ready():
+    """True when the GPU engine has everything it needs to run."""
+    return (os.path.isfile(WHISPERCPP_BIN)
+            and os.path.isfile(WHISPERCPP_MODEL)
+            and shutil.which(FFMPEG_BIN) is not None)
+
+def resolve_engine(choice):
+    """Turn TRANSCRIPTION_ENGINE into a concrete engine, explaining the decision.
+
+    "auto" prefers the GPU engine when `python setup.py` has installed it, then
+    falls back to faster-whisper, which downloads its own model on first run.
+    """
+    if choice != "auto":
+        return choice
+    if whispercpp_ready():
+        print("[Auto] Using whisper.cpp on GPU (Vulkan)")
+        return "whisper.cpp"
+    if cuda_available():
+        print("[Auto] Using faster-whisper on your NVIDIA GPU")
+        return "faster-whisper"
+    print("[Auto] Using faster-whisper on CPU. For much faster GPU transcription, "
+          "run: python setup.py")
+    return "faster-whisper"
+
+TRANSCRIPTION_ENGINE = resolve_engine(TRANSCRIPTION_ENGINE)
+
+# FORCE_DEVICE/device only apply to the faster-whisper and standard engines
+device = get_optimal_device(verbose=TRANSCRIPTION_ENGINE != "whisper.cpp")
+
+# Auto-detect a sensible thread count when left at 0
+if not CPU_THREADS:
+    CPU_THREADS = os.cpu_count() or 4
+if not WHISPERCPP_THREADS:
+    WHISPERCPP_THREADS = os.cpu_count() or 4
+
 if TRANSCRIPTION_ENGINE == "whisper.cpp":
-    # No model is loaded in-process; whisper-cli.exe loads it per file.
+    # No model is loaded in-process; whisper-cli loads it per file.
+    missing = []
     if not os.path.isfile(WHISPERCPP_BIN):
-        raise SystemExit(f"[!] whisper.cpp binary not found: {WHISPERCPP_BIN}\n"
-                         f"    Download the Vulkan build and extract it there, or switch "
-                         f"TRANSCRIPTION_ENGINE to 'faster-whisper'.")
+        missing.append(f"binary: {WHISPERCPP_BIN}")
     if not os.path.isfile(WHISPERCPP_MODEL):
-        raise SystemExit(f"[!] whisper.cpp model not found: {WHISPERCPP_MODEL}\n"
-                         f"    Download a GGML model, e.g. ggml-large-v3.bin from "
-                         f"https://huggingface.co/ggerganov/whisper.cpp")
+        missing.append(f"model:  {WHISPERCPP_MODEL}")
     if shutil.which(FFMPEG_BIN) is None:
-        raise SystemExit(f"[!] ffmpeg not found on PATH - required to decode audio for whisper.cpp")
+        missing.append("ffmpeg on PATH")
+    if missing:
+        raise SystemExit("[!] whisper.cpp engine is missing:\n    "
+                         + "\n    ".join(missing)
+                         + "\n\n    Run 'python setup.py' to install it, or set "
+                           "TRANSCRIPTION_ENGINE = \"auto\" in main.py to fall back to CPU.")
     print(f"Using whisper.cpp ({os.path.basename(WHISPERCPP_MODEL)}) on Vulkan device {WHISPERCPP_GPU_DEVICE}")
     print(f"[OK] GPU acceleration via Vulkan")
 elif TRANSCRIPTION_ENGINE == "faster-whisper":
