@@ -52,6 +52,8 @@ WHISPERCPP_MODEL = os.path.join("models", "ggml-large-v3.bin")
 WHISPERCPP_GPU_DEVICE = 0   # Vulkan device index (0 = first GPU listed at startup)
 WHISPERCPP_THREADS = 0      # CPU threads for non-GPU parts (0 = auto-detect)
 FFMPEG_BIN = "ffmpeg"       # ffmpeg executable, used to convert input to 16kHz mono WAV
+AUTO_DOWNLOAD_MODEL = True  # Offer to fetch the GGML model when the GPU binaries are
+                            # installed but the model is missing (asks first)
 
 # 🎯 Whisper Model Settings
 # "large-v3" is the most accurate model. "large-v3-turbo" is ~4x faster with a
@@ -128,11 +130,61 @@ def load_standard_whisper(target_device="cpu"):
 model = None
 faster_model = None
 
+def fetch_whispercpp_model():
+    """Download the GGML model for the GPU engine, asking first (it is GBs).
+
+    Returns True if the model is present afterwards. Declining, a non-interactive
+    shell, or a failed download all return False so the caller can fall back.
+    """
+    try:
+        from setup import MODEL_BASE, MODELS, download
+    except ImportError:
+        print("[!] setup.py not found - cannot auto-download the model")
+        return False
+
+    filename = os.path.basename(WHISPERCPP_MODEL)
+    size = next((s for f, s in MODELS.values() if f == filename), "several GB")
+
+    print(f"\n[Setup] GPU binaries are installed, but the model is missing:")
+    print(f"        {WHISPERCPP_MODEL}  ({size})")
+    if not sys.stdin.isatty():
+        print("        Run 'python setup.py' to download it. Using CPU for now.")
+        return False
+    try:
+        answer = input(f"[Setup] Download it now? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        # No one there to answer (piped stdin, CI, Ctrl+C at the prompt)
+        print("\n        Run 'python setup.py' to download it. Using CPU for now.")
+        return False
+    if answer not in ("", "y", "yes"):
+        print("        Skipped. Using CPU instead.")
+        return False
+
+    os.makedirs(os.path.dirname(WHISPERCPP_MODEL) or ".", exist_ok=True)
+    try:
+        download(MODEL_BASE + filename, WHISPERCPP_MODEL)
+    except KeyboardInterrupt:
+        print("\n[!] Download cancelled. Using CPU instead.")
+        return False
+    except Exception as e:
+        print(f"[!] Download failed: {e}")
+        return False
+    print(f"[OK] Saved to {WHISPERCPP_MODEL}")
+    return True
+
 def whispercpp_ready():
-    """True when the GPU engine has everything it needs to run."""
-    return (os.path.isfile(WHISPERCPP_BIN)
-            and os.path.isfile(WHISPERCPP_MODEL)
-            and shutil.which(FFMPEG_BIN) is not None)
+    """True when the GPU engine has everything it needs to run.
+
+    If the binaries and ffmpeg are in place but only the model is missing, offer
+    to download it rather than silently dropping to the much slower CPU engine.
+    """
+    if not os.path.isfile(WHISPERCPP_BIN) or shutil.which(FFMPEG_BIN) is None:
+        return False
+    if os.path.isfile(WHISPERCPP_MODEL):
+        return True
+    if AUTO_DOWNLOAD_MODEL:
+        return fetch_whispercpp_model()
+    return False
 
 def resolve_engine(choice):
     """Turn TRANSCRIPTION_ENGINE into a concrete engine, explaining the decision.
@@ -165,6 +217,9 @@ if not WHISPERCPP_THREADS:
 
 if TRANSCRIPTION_ENGINE == "whisper.cpp":
     # No model is loaded in-process; whisper-cli loads it per file.
+    if (AUTO_DOWNLOAD_MODEL and os.path.isfile(WHISPERCPP_BIN)
+            and not os.path.isfile(WHISPERCPP_MODEL)):
+        fetch_whispercpp_model()
     missing = []
     if not os.path.isfile(WHISPERCPP_BIN):
         missing.append(f"binary: {WHISPERCPP_BIN}")

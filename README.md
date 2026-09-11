@@ -59,6 +59,10 @@ versus an estimated ~12 minutes on CPU alone.
 Skipping it is fine - `main.py` falls back to the CPU engine, which downloads
 its own model on first run and needs no setup at all.
 
+If the GPU binaries are installed but the model is missing, `main.py` offers to
+download it for you rather than quietly dropping to CPU. Set
+`AUTO_DOWNLOAD_MODEL = False` to turn that prompt off.
+
 ## Requirements
 
 - Python 3.8 or higher
