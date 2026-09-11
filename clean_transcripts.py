@@ -157,69 +157,85 @@ def remove_word_repetitions(text, max_consecutive=2):
     return ' '.join(cleaned)
 
 
-def clean_transcript_file(file_path):
-    """Clean a single transcript file."""
-    print(f"\nProcessing: {file_path}")
-    
+def clean_text(text):
+    """Run every cleaning pass over one block of text and return the result."""
+    # Pass 1: Remove repetitive phrases (most important - catches longer patterns)
+    text = remove_repetitive_phrases(text, min_phrase_words=3)
+
+    # Pass 2: Remove excessive word repetitions
+    text = remove_word_repetitions(text, max_consecutive=2)
+
+    # Pass 3: Remove similar/related words (like "study studies studied")
+    text = remove_similar_word_sequences(text)
+
+    # Pass 4: Another pass for phrases (catches nested patterns)
+    text = remove_repetitive_phrases(text, min_phrase_words=3)
+
+    # Pass 5: Final cleanup of word repetitions. Keep two occurrences unless
+    # AGGRESSIVE is set - English genuinely doubles words ("had had",
+    # "that that", "New York, New York") and collapsing to one corrupts them.
+    text = remove_word_repetitions(text, max_consecutive=1 if AGGRESSIVE else 2)
+
+    # Collapse runs of spaces/tabs, but never newlines - see clean_transcript_file
+    return re.sub(r'[^\S\n]+', ' ', text).strip()
+
+
+def clean_transcript_file(file_path, write_backup=True, quiet=False):
+    """Clean a single transcript file in place.
+
+    Each line is cleaned independently so document structure survives - PPTX
+    output carries headers like '### PowerPoint Slide Content ###' and
+    '--- Slide 3 ---' that would otherwise be flattened into the prose.
+
+    Set write_backup=False to skip the '<name>_backup.txt' copy.
+    Returns True if the file was changed.
+    """
+    def say(msg):
+        if not quiet:
+            print(msg)
+
+    say(f"\nProcessing: {file_path}")
+
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             original_text = f.read()
-        
+
         if not original_text.strip():
-            print("  - File is empty, skipping")
-            return
-        
-        # Apply cleaning in multiple passes for better results
-        cleaned_text = original_text
-        
-        # Pass 1: Remove repetitive phrases (most important - catches longer patterns)
-        cleaned_text = remove_repetitive_phrases(cleaned_text, min_phrase_words=3)
-        
-        # Pass 2: Remove excessive word repetitions
-        cleaned_text = remove_word_repetitions(cleaned_text, max_consecutive=2)
-        
-        # Pass 3: Remove similar/related words (like "biodiversity diversity diversity")
-        cleaned_text = remove_similar_word_sequences(cleaned_text)
-        
-        # Pass 4: Another pass for phrases (catches nested patterns)
-        cleaned_text = remove_repetitive_phrases(cleaned_text, min_phrase_words=3)
-        
-        # Pass 5: Final cleanup of word repetitions. Keep two occurrences unless
-        # AGGRESSIVE is set - English genuinely doubles words ("had had",
-        # "that that", "New York, New York") and collapsing to one corrupts them.
-        cleaned_text = remove_word_repetitions(
-            cleaned_text, max_consecutive=1 if AGGRESSIVE else 2
-        )
-        
-        # Clean up extra whitespace
-        cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
-        cleaned_text = cleaned_text.strip()
-        
+            say("  - File is empty, skipping")
+            return False
+
+        # Clean line by line so blank lines and headers keep their place
+        cleaned_lines = [clean_text(line) if line.strip() else ""
+                         for line in original_text.split("\n")]
+        cleaned_text = "\n".join(cleaned_lines).strip()
+
         # Save if changes were made
         if cleaned_text != original_text:
-            # Create backup
-            backup_path = str(file_path).replace('.txt', '_backup.txt')
-            with open(backup_path, 'w', encoding='utf-8') as f:
-                f.write(original_text)
-            print(f"  - Backup saved to: {backup_path}")
-            
-            # Save cleaned version
+            if write_backup:
+                backup_path = str(file_path).replace('.txt', '_backup.txt')
+                with open(backup_path, 'w', encoding='utf-8') as f:
+                    f.write(original_text)
+                say(f"  - Backup saved to: {backup_path}")
+
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(cleaned_text)
-            
+
             original_size = len(original_text)
             cleaned_size = len(cleaned_text)
             reduction = ((original_size - cleaned_size) / original_size) * 100
-            
-            print(f"  ✓ Cleaned successfully!")
-            print(f"  - Original size: {original_size} chars")
-            print(f"  - Cleaned size: {cleaned_size} chars")
-            print(f"  - Reduction: {reduction:.1f}%")
+
+            say(f"  ✓ Cleaned successfully!")
+            say(f"  - Original size: {original_size} chars")
+            say(f"  - Cleaned size: {cleaned_size} chars")
+            say(f"  - Reduction: {reduction:.1f}%")
+            return True
         else:
-            print("  - No repetitions found")
-            
+            say("  - No repetitions found")
+            return False
+
     except Exception as e:
-        print(f"  ✗ Error processing file: {e}")
+        say(f"  ✗ Error processing file: {e}")
+        return False
 
 
 def clean_output_folder(folder_path='output'):

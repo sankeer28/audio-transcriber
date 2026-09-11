@@ -7,6 +7,9 @@ import warnings
 import json
 import subprocess
 import tempfile
+import argparse
+import io
+import contextlib
 from pathlib import Path
 from pptx import Presentation
 from faster_whisper import WhisperModel
@@ -51,6 +54,12 @@ WHISPERCPP_BIN = os.path.join("whispercpp", "whisper-cli" + _EXE)
 WHISPERCPP_MODEL = os.path.join("models", "ggml-large-v3.bin")
 WHISPERCPP_GPU_DEVICE = 0   # Vulkan device index (0 = first GPU listed at startup)
 WHISPERCPP_THREADS = 0      # CPU threads for non-GPU parts (0 = auto-detect)
+# Text context carried between 30s windows. This is the main cause of Whisper's
+# repetition loops, where it repeats one sentence for minutes and never
+# transcribes the real speech. 0 disables it and is strongly recommended:
+# on a test lecture it recovered 532 words of real content instead of 200.
+# Set to -1 for the library default if you need cross-window context.
+WHISPERCPP_MAX_CONTEXT = 0
 FFMPEG_BIN = "ffmpeg"       # ffmpeg executable, used to convert input to 16kHz mono WAV
 AUTO_DOWNLOAD_MODEL = True  # Offer to fetch the GGML model when the GPU binaries are
                             # installed but the model is missing (asks first)
@@ -75,7 +84,56 @@ CPU_BEAM_SIZE = 5               # Beam search size on CPU (5 = Whisper's referen
 TEMPERATURE = 0.0               # 0.0 = deterministic, 0.1-1.0 = more creative
 ENABLE_WORD_TIMESTAMPS = True   # Get word-level timing data
 
-os.makedirs(PPTX_FOLDER, exist_ok=True)
+# 🧹 Transcript Cleanup - Whisper sometimes loops on a phrase and repeats it
+# dozens of times. Each finished transcript is cleaned automatically.
+AUTO_CLEAN_TRANSCRIPTS = True   # Run clean_transcripts.py on each output file
+CLEAN_WRITE_BACKUP = False      # Keep a '<name>_backup.txt' of the raw transcript
+
+# 🖥️ Command line overrides (all optional - defaults come from the settings above)
+INPUT_PATH = PPTX_FOLDER
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description="Transcribe PowerPoint, MP4 and MP3 files to text.",
+        epilog="Examples:\n"
+               "  python main.py                        process the presentations/ folder\n"
+               "  python main.py lecture.mp4            process one file\n"
+               "  python main.py \"WEEK 1/videos\" -o \"WEEK 1\"\n"
+               "  python main.py -i videos -o transcripts --engine faster-whisper",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("input", nargs="?", default=None,
+                    help=f"file or folder to transcribe (default: {PPTX_FOLDER})")
+    ap.add_argument("-i", "--input", dest="input_opt", default=None,
+                    help="same as the positional argument")
+    ap.add_argument("-o", "--output", default=None,
+                    help=f"folder to write transcripts into (default: {OUTPUT_FOLDER})")
+    ap.add_argument("--engine", choices=["auto", "whisper.cpp", "faster-whisper", "standard"],
+                    help="override the transcription engine")
+    ap.add_argument("--model", help="path to a GGML model (whisper.cpp engine)")
+    ap.add_argument("--no-clean", action="store_true",
+                    help="keep raw output; do not remove repeated text")
+    ap.add_argument("--backup", action="store_true",
+                    help="also write '<name>_backup.txt' with the uncleaned transcript")
+    return ap.parse_args()
+
+# Only parse when run directly, so importing main.py from another script is safe
+if __name__ == "__main__":
+    _args = parse_args()
+    INPUT_PATH = _args.input_opt or _args.input or PPTX_FOLDER
+    if _args.output:
+        OUTPUT_FOLDER = _args.output
+    if _args.engine:
+        TRANSCRIPTION_ENGINE = _args.engine
+    if _args.model:
+        WHISPERCPP_MODEL = _args.model
+    if _args.no_clean:
+        AUTO_CLEAN_TRANSCRIPTS = False
+    if _args.backup:
+        CLEAN_WRITE_BACKUP = True
+
+# Only auto-create the default input folder; never turn a given path into one
+if INPUT_PATH == PPTX_FOLDER:
+    os.makedirs(PPTX_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 def cuda_available():
@@ -309,6 +367,31 @@ def save_checkpoint(checkpoint_file, checkpoint_data):
     with open(checkpoint_file, 'w', encoding='utf-8') as f:
         json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
 
+def clean_output_file(output_path):
+    """Strip Whisper's repetition loops from a finished transcript, in place."""
+    if not AUTO_CLEAN_TRANSCRIPTS:
+        return
+    try:
+        import clean_transcripts
+    except ImportError:
+        print("[!] clean_transcripts.py not found - skipping cleanup")
+        return
+
+    try:
+        before = os.path.getsize(output_path)
+        # The individual passes log every removal; keep that out of the run log
+        with contextlib.redirect_stdout(io.StringIO()):
+            changed = clean_transcripts.clean_transcript_file(
+                output_path, write_backup=CLEAN_WRITE_BACKUP, quiet=True
+            )
+        if changed:
+            after = os.path.getsize(output_path)
+            saved = (before - after) / before * 100 if before else 0
+            print(f"[Cleaned] Removed repeated text ({saved:.1f}% smaller)")
+    except Exception as e:
+        # Never lose a transcript because cleanup failed
+        print(f"[!] Cleanup failed for {output_path}: {e}")
+
 def convert_to_wav16k(src_path, dst_path):
     """Decode any input (mp3/mp4/m4a/wav) to the 16kHz mono WAV whisper.cpp expects."""
     subprocess.run(
@@ -342,6 +425,7 @@ def transcribe_with_whispercpp(audio_path, checkpoint_file):
             "-t", str(WHISPERCPP_THREADS),
             "-bs", str(GPU_BEAM_SIZE),
             "-dev", str(WHISPERCPP_GPU_DEVICE),
+            "-mc", str(WHISPERCPP_MAX_CONTEXT),
             "-oj", "-of", out_base,
             "-pp",
         ]
@@ -618,6 +702,7 @@ def process_pptx(pptx_path):
             f.write("\n\n".join(final_output))
 
         print(f"[OK] Saved results to {output_path}")
+        clean_output_file(output_path)
 
     finally:
         # Cleanup extracted media
@@ -639,6 +724,7 @@ def process_mp3(mp3_path):
             f.write(f"### MP3 Audio Transcription ###\n\n{result['text'].strip()}")
 
         print(f"[OK] Saved transcription to {output_path}")
+        clean_output_file(output_path)
 
         # Clear GPU cache if using CUDA
         clear_gpu_cache()
@@ -662,6 +748,7 @@ def process_mp4(mp4_path):
             f.write(result['text'].strip())
 
         print(f"[OK] Saved transcription to {output_path}")
+        clean_output_file(output_path)
 
         # Clear GPU cache if using CUDA
         clear_gpu_cache()
@@ -669,31 +756,44 @@ def process_mp4(mp4_path):
     except Exception as e:
         print(f"[ERROR] Error processing {mp4_path}: {e}")
 
+HANDLERS = {".pptx": process_pptx, ".mp3": process_mp3, ".mp4": process_mp4}
+
+def process_one(path):
+    """Dispatch a single input file to the right handler by extension."""
+    handler = HANDLERS.get(os.path.splitext(path)[1].lower())
+    if handler is None:
+        print(f"[!] Unsupported file type: {path}")
+        return False
+    handler(path)
+    return True
+
 def main():
-    # Scan for all supported file types
-    pptx_files = [f for f in os.listdir(PPTX_FOLDER) if f.lower().endswith(".pptx")]
-    mp3_files = [f for f in os.listdir(PPTX_FOLDER) if f.lower().endswith(".mp3")]
-    mp4_files = [f for f in os.listdir(PPTX_FOLDER) if f.lower().endswith(".mp4")]
-
-    total_files = len(pptx_files) + len(mp3_files) + len(mp4_files)
-
-    if total_files == 0:
-        print(f"[!] No .pptx, .mp3, or .mp4 files found in {PPTX_FOLDER}")
+    # A single file was given - just do that one
+    if os.path.isfile(INPUT_PATH):
+        print(f"[Files] Processing 1 file -> {OUTPUT_FOLDER}")
+        process_one(INPUT_PATH)
         return
 
-    print(f"[Files] Found {len(pptx_files)} PPTX, {len(mp3_files)} MP3, {len(mp4_files)} MP4 files")
+    if not os.path.isdir(INPUT_PATH):
+        print(f"[!] Input not found: {INPUT_PATH}")
+        return
 
-    # Process PPTX files
-    for file in pptx_files:
-        process_pptx(os.path.join(PPTX_FOLDER, file))
+    # Scan the folder for all supported file types
+    entries = sorted(os.listdir(INPUT_PATH))
+    by_type = {ext: [f for f in entries if f.lower().endswith(ext)]
+               for ext in HANDLERS}
 
-    # Process MP3 files
-    for file in mp3_files:
-        process_mp3(os.path.join(PPTX_FOLDER, file))
+    total_files = sum(len(v) for v in by_type.values())
+    if total_files == 0:
+        print(f"[!] No .pptx, .mp3, or .mp4 files found in {INPUT_PATH}")
+        return
 
-    # Process MP4 files
-    for file in mp4_files:
-        process_mp4(os.path.join(PPTX_FOLDER, file))
+    print(f"[Files] Found {len(by_type['.pptx'])} PPTX, {len(by_type['.mp3'])} MP3, "
+          f"{len(by_type['.mp4'])} MP4 files in {INPUT_PATH} -> {OUTPUT_FOLDER}")
+
+    for ext in (".pptx", ".mp3", ".mp4"):
+        for file in by_type[ext]:
+            process_one(os.path.join(INPUT_PATH, file))
 
 if __name__ == "__main__":
     main()
