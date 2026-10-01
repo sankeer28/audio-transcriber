@@ -28,6 +28,14 @@ try:
 except ImportError:
     torch = None
 
+# python-docx is optional: only needed to read .docx handouts
+try:
+    from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+except ImportError:
+    Document = None
+
 # Fix Windows console encoding issues
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -756,7 +764,77 @@ def process_mp4(mp4_path):
     except Exception as e:
         print(f"[ERROR] Error processing {mp4_path}: {e}")
 
-HANDLERS = {".pptx": process_pptx, ".mp3": process_mp3, ".mp4": process_mp4}
+def iter_docx_blocks(doc):
+    """Yield paragraphs and tables in the order they appear in the document."""
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            yield Paragraph(child, doc)
+        elif tag == "tbl":
+            yield Table(child, doc)
+
+def extract_text_from_docx(docx_path):
+    """Extract a Word document as readable text, keeping its structure.
+
+    Headings become '## Heading', list items become '- item', and tables are
+    written one row per line with ' | ' between cells.
+    """
+    doc = Document(docx_path)
+    out = []
+    for block in iter_docx_blocks(doc):
+        if isinstance(block, Paragraph):
+            text = block.text.strip()
+            if not text:
+                continue
+            style = (block.style.name or "").lower()
+            if style.startswith("heading") or style == "title":
+                out += ["", f"## {text}", ""]
+            elif style.startswith("list"):
+                out.append(f"- {text}")
+            else:
+                out.append(text)
+        else:  # Table
+            out.append("")
+            for row in block.rows:
+                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                # python-docx repeats merged cells; collapse the duplicates
+                dedup = [c for i, c in enumerate(cells) if i == 0 or c != cells[i - 1]]
+                if any(dedup):
+                    out.append(" | ".join(dedup))
+            out.append("")
+
+    # collapse runs of blank lines
+    lines, prev_blank = [], False
+    for ln in out:
+        blank = not ln.strip()
+        if blank and prev_blank:
+            continue
+        lines.append(ln)
+        prev_blank = blank
+    return "\n".join(lines).strip() + "\n"
+
+def process_docx(docx_path):
+    """Process a Word document: extract text -> output TXT file."""
+    print(f"\n[DOCX] Processing {docx_path}...")
+    if Document is None:
+        print("[ERROR] python-docx is not installed. Run: pip install python-docx")
+        return
+
+    # A trailing space before the extension is common; don't carry it into the name
+    base_name = os.path.splitext(os.path.basename(docx_path))[0].strip()
+    try:
+        text = extract_text_from_docx(docx_path)
+        output_path = os.path.join(OUTPUT_FOLDER, base_name + ".txt")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"[OK] Saved text to {output_path} ({len(text.split())} words)")
+        # No cleanup pass here: this text came from a document, not from Whisper,
+        # so it has no repetition loops to remove and nothing to gain from it.
+    except Exception as e:
+        print(f"[ERROR] Error processing {docx_path}: {e}")
+
+HANDLERS = {".pptx": process_pptx, ".mp3": process_mp3, ".mp4": process_mp4,
+            ".docx": process_docx}
 
 def process_one(path):
     """Dispatch a single input file to the right handler by extension."""
@@ -771,6 +849,7 @@ def main():
     # A single file was given - just do that one
     if os.path.isfile(INPUT_PATH):
         print(f"[Files] Processing 1 file -> {OUTPUT_FOLDER}")
+        print(f"[Files] Total: 1")
         process_one(INPUT_PATH)
         return
 
@@ -785,13 +864,16 @@ def main():
 
     total_files = sum(len(v) for v in by_type.values())
     if total_files == 0:
-        print(f"[!] No .pptx, .mp3, or .mp4 files found in {INPUT_PATH}")
+        supported = ", ".join(sorted(HANDLERS))
+        print(f"[!] No {supported} files found in {INPUT_PATH}")
         return
 
-    print(f"[Files] Found {len(by_type['.pptx'])} PPTX, {len(by_type['.mp3'])} MP3, "
-          f"{len(by_type['.mp4'])} MP4 files in {INPUT_PATH} -> {OUTPUT_FOLDER}")
+    breakdown = ", ".join(f"{len(by_type[ext])} {ext.lstrip('.').upper()}"
+                          for ext in HANDLERS)
+    print(f"[Files] Found {breakdown} files in {INPUT_PATH} -> {OUTPUT_FOLDER}")
+    print(f"[Files] Total: {total_files}")
 
-    for ext in (".pptx", ".mp3", ".mp4"):
+    for ext in HANDLERS:
         for file in by_type[ext]:
             process_one(os.path.join(INPUT_PATH, file))
 
